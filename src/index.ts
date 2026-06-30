@@ -4,6 +4,9 @@ const ROOM_PATH_RE = /^\/r\/([A-Za-z0-9_-]{10,64})$/;
 const ENVELOPE_HEADER_LENGTH = 4;
 const HEARTBEAT_INTERVAL_MS = 25_000;
 const HEARTBEAT_CONTROL = JSON.stringify({ t: "ping" });
+const HOST_RECONNECT_GRACE_MS = 120_000;
+const HOST_GRACE_STORAGE_KEY = "hostGraceUntil";
+const MAX_PENDING_HOST_FRAMES = 256;
 
 type RelayRole = "host" | "guest";
 
@@ -17,6 +20,8 @@ interface RoomState {
 	host: WebSocket | null;
 	guests: Map<number, WebSocket>;
 	nextPeerId: number;
+	hostGraceUntil: number | null;
+	pendingHostFrames: ArrayBuffer[];
 }
 
 function unpackEnvelope(data: ArrayBuffer): { peerId: number } | null {
@@ -55,8 +60,8 @@ export class CollabRelayRoom extends DurableObject<Env> {
 		const [client, server] = Object.values(pair);
 		server.binaryType = "arraybuffer";
 		this.ctx.acceptWebSocket(server);
-		this.#open(server, parsed.roomId, parsed.role);
-		void this.#scheduleHeartbeat();
+		await this.#open(server, parsed.roomId, parsed.role);
+		await this.#scheduleHeartbeat();
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
@@ -78,13 +83,19 @@ export class CollabRelayRoom extends DurableObject<Env> {
 			return;
 		}
 
-		if (message.byteLength < ENVELOPE_HEADER_LENGTH || !this.#room.host) return;
+		if (message.byteLength < ENVELOPE_HEADER_LENGTH) return;
 		rewriteEnvelopePeer(message, attachment.peerId);
-		this.#room.host.send(message);
+		if (this.#room.host) {
+			this.#room.host.send(message);
+			return;
+		}
+		if ((await this.#hostGraceUntil()) !== null && this.#room.pendingHostFrames.length < MAX_PENDING_HOST_FRAMES) {
+			this.#room.pendingHostFrames.push(message);
+		}
 	}
 
-	async webSocketClose(ws: WebSocket): Promise<void> {
-		this.#close(ws);
+	async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+		this.#close(ws, code);
 	}
 
 	async webSocketError(ws: WebSocket): Promise<void> {
@@ -92,22 +103,31 @@ export class CollabRelayRoom extends DurableObject<Env> {
 	}
 
 	async alarm(): Promise<void> {
+		const hostGraceUntil =
+			this.#room.hostGraceUntil ?? (await this.ctx.storage.get<number>(HOST_GRACE_STORAGE_KEY)) ?? null;
+		if (hostGraceUntil !== null && Date.now() >= hostGraceUntil) {
+			await this.#endRoom();
+			return;
+		}
 		this.#sendHeartbeat();
 		await this.#scheduleHeartbeat();
 	}
 
-	#open(ws: WebSocket, roomId: string, role: RelayRole): void {
+	async #open(ws: WebSocket, roomId: string, role: RelayRole): Promise<void> {
 		if (role === "host") {
 			if (this.#room.host) {
 				ws.close(4009, "a host is already connected for this room");
 				return;
 			}
 			this.#room.host = ws;
+			this.#room.hostGraceUntil = null;
+			await this.ctx.storage.delete(HOST_GRACE_STORAGE_KEY);
 			ws.serializeAttachment({ roomId, role, peerId: 0 } satisfies SocketAttachment);
+			for (const frame of this.#room.pendingHostFrames.splice(0)) ws.send(frame);
 			return;
 		}
 
-		if (!this.#room.host) {
+		if (!this.#room.host && this.#room.guests.size === 0 && (await this.#hostGraceUntil()) === null) {
 			ws.close(4004, "no such room");
 			return;
 		}
@@ -115,23 +135,21 @@ export class CollabRelayRoom extends DurableObject<Env> {
 		const peerId = this.#room.nextPeerId++;
 		this.#room.guests.set(peerId, ws);
 		ws.serializeAttachment({ roomId, role, peerId } satisfies SocketAttachment);
-		this.#room.host.send(JSON.stringify({ t: "peer-joined", peer: peerId }));
+		this.#room.host?.send(JSON.stringify({ t: "peer-joined", peer: peerId }));
 	}
 
-	#close(ws: WebSocket): void {
+	#close(ws: WebSocket, code = 1005): void {
 		const attachment = this.#attachment(ws);
 		if (!attachment) return;
 
 		if (attachment.role === "host") {
 			if (this.#room.host !== ws) return;
 			this.#room.host = null;
-			const closure = JSON.stringify({ t: "room-closed" });
-			for (const guest of this.#room.guests.values()) {
-				guest.send(closure);
-				guest.close(4001, "room closed");
+			if (code === 1000) {
+				void this.#endRoom();
+				return;
 			}
-			this.#room.guests.clear();
-			void this.#clearHeartbeatIfIdle();
+			void this.#beginHostGrace();
 			return;
 		}
 
@@ -149,19 +167,55 @@ export class CollabRelayRoom extends DurableObject<Env> {
 	}
 
 	async #scheduleHeartbeat(): Promise<void> {
-		if (this.#socketCount() === 0) {
+		const hostGraceUntil = await this.#hostGraceUntil();
+		if (this.#socketCount() === 0 && hostGraceUntil === null) {
 			await this.ctx.storage.deleteAlarm();
 			return;
 		}
-		await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+		const heartbeatAt = Date.now() + HEARTBEAT_INTERVAL_MS;
+		await this.ctx.storage.setAlarm(hostGraceUntil === null ? heartbeatAt : Math.min(heartbeatAt, hostGraceUntil));
 	}
 
 	async #clearHeartbeatIfIdle(): Promise<void> {
-		if (this.#socketCount() === 0) await this.ctx.storage.deleteAlarm();
+		if (this.#socketCount() === 0 && (await this.#hostGraceUntil()) === null) await this.ctx.storage.deleteAlarm();
 	}
 
 	#socketCount(): number {
 		return (this.#room.host ? 1 : 0) + this.#room.guests.size;
+	}
+
+	async #beginHostGrace(): Promise<void> {
+		const hostGraceUntil = Date.now() + HOST_RECONNECT_GRACE_MS;
+		this.#room.hostGraceUntil = hostGraceUntil;
+		await this.ctx.storage.put(HOST_GRACE_STORAGE_KEY, hostGraceUntil);
+		for (const guest of this.#room.guests.values()) guest.close(1012, "host reconnecting");
+		this.#room.guests.clear();
+		await this.#scheduleHeartbeat();
+	}
+
+	async #hostGraceUntil(): Promise<number | null> {
+		if (this.#room.hostGraceUntil !== null) return this.#room.hostGraceUntil;
+		const stored = await this.ctx.storage.get<number>(HOST_GRACE_STORAGE_KEY);
+		if (typeof stored === "number" && Date.now() >= stored) {
+			await this.ctx.storage.delete(HOST_GRACE_STORAGE_KEY);
+			return null;
+		}
+		this.#room.hostGraceUntil = typeof stored === "number" ? stored : null;
+		return this.#room.hostGraceUntil;
+	}
+
+	async #endRoom(): Promise<void> {
+		this.#room.host = null;
+		this.#room.hostGraceUntil = null;
+		this.#room.pendingHostFrames.length = 0;
+		await this.ctx.storage.delete(HOST_GRACE_STORAGE_KEY);
+		const closure = JSON.stringify({ t: "room-closed" });
+		for (const guest of this.#room.guests.values()) {
+			guest.send(closure);
+			guest.close(4001, "room closed");
+		}
+		this.#room.guests.clear();
+		await this.#clearHeartbeatIfIdle();
 	}
 
 	#attachment(ws: WebSocket): SocketAttachment | null {
@@ -194,7 +248,7 @@ export class CollabRelayRoom extends DurableObject<Env> {
 			}
 		}
 
-		return { host, guests, nextPeerId };
+		return { host, guests, nextPeerId, hostGraceUntil: null, pendingHostFrames: [] };
 	}
 }
 

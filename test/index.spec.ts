@@ -186,4 +186,26 @@ describe("collab relay worker", () => {
 		expect(JSON.parse(await closure)).toEqual({ t: "room-closed" });
 		expect((await guestClose).code).toBe(4001);
 	});
+
+	it("keeps a room recoverable when the host disconnects abnormally", async () => {
+		const room = "RelayRoom_Reconnects";
+		const host = await socket(`/r/${room}?role=host`);
+
+		const guest = await socket(`/r/${room}?role=guest`);
+		expect(JSON.parse(await waitText(host, "peer join"))).toEqual({ t: "peer-joined", peer: 1 });
+
+		const guestReconnectClose = waitEvent<CloseEvent>(guest, "close", "guest reconnect close");
+		host.close(1012, "service restart");
+		const close = await guestReconnectClose;
+		expect(close.code).toBe(1012);
+		expect(close.reason).toBe("host reconnecting");
+
+		const reconnectedGuest = await socket(`/r/${room}?role=guest`);
+		reconnectedGuest.send(packEnvelope(0, new Uint8Array([4, 5, 6])));
+
+		const replacementHost = await socket(`/r/${room}?role=host`);
+		const fromGuest = unpackEnvelope(await waitBinary(replacementHost, "buffered guest envelope"));
+		expect(fromGuest?.peerId).toBe(2);
+		expect(fromGuest?.payload).toEqual(new Uint8Array([4, 5, 6]));
+	});
 });
