@@ -11,8 +11,28 @@
 		"enabled": true
 	},
 	"upload_source_maps": true,
+	"assets": {
+		"directory": "./public/",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": ["/r/*"]
+	},
 	"compatibility_flags": [
 		"nodejs_compat"
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "COLLAB_RELAY_ROOM",
+				"class_name": "CollabRelayRoom"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["CollabRelayRoom"]
+		}
 	]
 	/**
 	 * Smart Placement
