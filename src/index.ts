@@ -2,6 +2,8 @@ import { DurableObject } from "cloudflare:workers";
 
 const ROOM_PATH_RE = /^\/r\/([A-Za-z0-9_-]{10,64})$/;
 const ENVELOPE_HEADER_LENGTH = 4;
+const HEARTBEAT_INTERVAL_MS = 25_000;
+const HEARTBEAT_CONTROL = JSON.stringify({ t: "ping" });
 
 type RelayRole = "host" | "guest";
 
@@ -54,6 +56,7 @@ export class CollabRelayRoom extends DurableObject<Env> {
 		server.binaryType = "arraybuffer";
 		this.ctx.acceptWebSocket(server);
 		this.#open(server, parsed.roomId, parsed.role);
+		void this.#scheduleHeartbeat();
 
 		return new Response(null, { status: 101, webSocket: client });
 	}
@@ -86,6 +89,11 @@ export class CollabRelayRoom extends DurableObject<Env> {
 
 	async webSocketError(ws: WebSocket): Promise<void> {
 		this.#close(ws);
+	}
+
+	async alarm(): Promise<void> {
+		this.#sendHeartbeat();
+		await this.#scheduleHeartbeat();
 	}
 
 	#open(ws: WebSocket, roomId: string, role: RelayRole): void {
@@ -123,12 +131,37 @@ export class CollabRelayRoom extends DurableObject<Env> {
 				guest.close(4001, "room closed");
 			}
 			this.#room.guests.clear();
+			void this.#clearHeartbeatIfIdle();
 			return;
 		}
 
 		if (this.#room.guests.delete(attachment.peerId)) {
 			this.#room.host?.send(JSON.stringify({ t: "peer-left", peer: attachment.peerId }));
+			void this.#clearHeartbeatIfIdle();
 		}
+	}
+
+	#sendHeartbeat(): void {
+		if (this.#room.host?.readyState === WebSocket.OPEN) this.#room.host.send(HEARTBEAT_CONTROL);
+		for (const guest of this.#room.guests.values()) {
+			if (guest.readyState === WebSocket.OPEN) guest.send(HEARTBEAT_CONTROL);
+		}
+	}
+
+	async #scheduleHeartbeat(): Promise<void> {
+		if (this.#socketCount() === 0) {
+			await this.ctx.storage.deleteAlarm();
+			return;
+		}
+		await this.ctx.storage.setAlarm(Date.now() + HEARTBEAT_INTERVAL_MS);
+	}
+
+	async #clearHeartbeatIfIdle(): Promise<void> {
+		if (this.#socketCount() === 0) await this.ctx.storage.deleteAlarm();
+	}
+
+	#socketCount(): number {
+		return (this.#room.host ? 1 : 0) + this.#room.guests.size;
 	}
 
 	#attachment(ws: WebSocket): SocketAttachment | null {
